@@ -1,0 +1,297 @@
+---
+title: "Vendex Expansion"
+author: "Team A4"
+date: "3/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Vendex Expansion - Income Sensitive Machines
+
+One approach to making an expansion plan according to income would be to examine the makeup and positioning of machines for which income level is high. However, to make the analysis more refined we created regression models to predict machine daily sales, both with and without income as an input for the modeling. As such, we can isolate the machines for which income appears to influence sales the most.
+
+#### Step 1 - Prepare the data for modeling
+
+```{r, message = FALSE, warning = FALSE}
+
+# Library loading
+library(data.table)
+library(tidyverse)
+library(tidymodels)
+library(corrplot)
+library(cluster)
+library(scales)
+library(factoextra)
+library(lattice)
+
+# Clear contents
+rm(list=ls())
+
+# Data loading
+td  <- fread('./Data/Vendex/transactional_data.csv')
+md  <- fread('./Data/Vendex/machine_data.csv')
+pd <- fread('./Data/Vendex/product_data.csv')
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Compute product margins and add to transactional data table 
+pd <- pd %>% 
+  mutate(margin = (price/(1 + tax_rate)) - cost)
+
+td <- left_join(td, pd, by = 'product_name')
+
+# Compute total margin per machine and add to machine data table
+machine_margin <- td %>% group_by(machine) %>%
+                         summarize (machine_margin = sum(margin))
+
+md <- left_join(md, machine_margin, by = 'machine')
+
+# Compute daily sales per machine
+daily_sales <- td %>% 
+  group_by(machine) %>% 
+  summarise(daily_sales = n() / uniqueN(date))
+
+# Model data creation
+data <- left_join(md, daily_sales, by = 'machine')
+
+# Check for NA data
+colSums(is.na(data))
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Feature engineering
+data <- data %>% 
+    mutate(log_transport = log10(total_number_of_routes_600),
+           log_transport = replace_na(log_transport, median(log_transport, na.rm = TRUE)),
+           has_train = ifelse(is.na(train_AvgDailyPassengers), yes = 1, no = 0),
+           income_average = replace_na(as.numeric(income_average), median(as.numeric(income_average), na.rm = TRUE)))
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Check correlation between different features to be used in the model
+M = cor(data[, c('daily_sales', 'has_train',
+                 'num_hotels_45', 'log_transport',
+                 'num_vendex_nearby_300', 'small_machine', 
+                 'income_average', 'n_density_5km')])
+corrplot(M, method = 'number')
+```
+
+No excessive correlations found in the table (> 0.8), so we can continue with the modeling.
+
+#### Step 2 - Create the Regression Model, excluding income
+
+```{r, message = FALSE, warning = FALSE}
+
+model_data <- data[, c('daily_sales', 'has_train',
+                       'num_hotels_45', 'log_transport',
+                       'num_vendex_nearby_300', 'small_machine',
+                       'n_density_5km')]
+
+# Prepare and fit the model
+set.seed(1)
+model_split <- initial_split(data = model_data, prop = 0.8)
+model_train <- training(model_split)
+model_test <- testing(model_split)
+
+model_lm <- linear_reg() %>% set_engine('lm')
+model_lm_fit <- model_lm %>% 
+                fit(daily_sales ~ ., data = model_train)
+
+# Predict on the train and test sets
+model_train <- model_train %>% 
+  bind_cols(predict(object = model_lm_fit, new_data = model_train %>% select(-daily_sales)))
+
+model_test <- model_test %>% 
+  bind_cols(predict(object = model_lm_fit, new_data = model_test %>% select(-daily_sales)))
+
+# Calculate RSQ on both train and test set
+wo_income_rsq_train <- rsq(model_train, truth = daily_sales, estimate = .pred)[3] %>% as.numeric() %>% round(4)
+
+wo_income_rsq_test <- rsq(model_test, truth = daily_sales, estimate = .pred)[3] %>% as.numeric() %>% round(4)
+
+print(paste0("The R Squared on the train set is ", wo_income_rsq_train))
+print(paste0("The R Squared on the test set is ", wo_income_rsq_test))
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Add prediction column to original data based on our model
+data <- data %>% bind_cols(predict(object = model_lm_fit, 
+                                   new_data = data %>% select(-daily_sales))
+)
+
+# Rename prediction column
+setnames(data, ".pred", "pred_wo_income")
+```
+
+#### Step 3 - Create the Regression Model, now including income
+
+```{r, message = FALSE, warning = FALSE}
+
+model_data <- data[, c('daily_sales', 'has_train',
+                       'num_hotels_45', 'log_transport',
+                       'num_vendex_nearby_300', 'small_machine',
+                       'n_density_5km', 'income_average')]
+
+# Prepare and fit the model
+model_split <- initial_split(data = model_data, prop = 0.8)
+model_train <- training(model_split)
+model_test <- testing(model_split)
+
+model_lm_fit <- model_lm %>% 
+  fit(daily_sales ~ ., data = model_train)
+
+# Predict on the train and test sets
+model_train <- model_train %>% 
+  bind_cols(predict(object = model_lm_fit, new_data = model_train %>% select(-daily_sales)))
+
+model_test <- model_test %>% 
+  bind_cols(predict(object = model_lm_fit, new_data = model_test %>% select(-daily_sales)))
+
+# Calculate RSQ on both train and test set
+w_income_rsq_train <- rsq(model_train, truth = daily_sales, estimate = .pred)[3] %>% 
+  as.numeric() %>% round(4)
+w_income_rsq_test <- rsq(model_test, truth = daily_sales, estimate = .pred)[3] %>%
+  as.numeric() %>% round(4)
+
+# Add prediction column to original data based on our model
+data <- data %>% bind_cols(predict(object = model_lm_fit, 
+                                   new_data = data %>% select(-daily_sales))
+)
+setnames(data, ".pred", "pred_w_income")
+
+print(paste0("The R Squared on the train set is ", w_income_rsq_train))
+print(paste0("The R Squared on the test set is ", w_income_rsq_test))
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Calculate estimated bump in predicted sales for each machine from including income
+data <-  data %>% mutate(income_influence = (pred_w_income - pred_wo_income) / pred_wo_income * 100)
+
+data
+
+# See for which machines the income makes at least 5% increase in predicted sales
+income_impact <- data %>% select(machine, income_influence) %>%
+                 arrange(-income_influence) %>%
+                 subset(income_influence > 5)
+
+income_impact$income_influence <- income_impact$income_influence %>% round(2)
+
+income_impact
+```
+
+Now that we have identified 'income-sensitive' machines, we'd like to understand how they are composed. To make a strategy for market expansion, we will choose one type of 'income-sensitive' machine to target.
+
+#### Step 4 - Cluster 'income-sensitive' machines
+
+```{r, message = FALSE, warning = FALSE}
+
+# Subset transaction data for only the top machines
+machine_subset <- income_impact$machine %>% unlist()
+
+# Isolate data subset for further analysis
+data_subset <- data[data$machine %in% machine_subset,] %>% 
+  select(-c(train_AvgDailyPassengers, 
+            train_AvgWorkingDayPassengers,
+            num_hotels,
+            pred_wo_income,
+            pred_w_income,
+            income_influence,
+            total_number_of_routes_600,
+            machine,
+            location_type,))
+
+data_subset
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Store means and standard deviations of the features (for reverting scaled cluster data back to actual data later)
+means <- data_subset %>% summarise(across(where(is.numeric), mean))
+sds <- data_subset %>% summarise(across(where(is.numeric), sd))
+
+# Scaling all variables at once
+data_scaled <- data_subset %>% mutate(across(where(is.numeric), scale))
+
+data_scaled
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Test a number of clusters
+kclusts <-
+  tibble(k = 1:15) %>%
+  mutate(
+    kclust = map(k, ~ kmeans(data_scaled, .x, nstart = 10)),
+    metrics = map(kclust, glance)
+  )
+
+# Check clusters using the elbow method
+kclusts %>%
+  unnest(cols = c(metrics)) %>%
+  ggplot(aes(k, tot.withinss)) +
+  geom_line(alpha = 0.5, size = 1.2, color = "midnightblue") +
+  geom_point(size = 2, color = "midnightblue") +
+  labs(title = 'TOTAL sum of squares within cluster') +
+  theme_light()
+
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Choose 3 clusters given the small dataset and interpretability needs
+k <- 3
+clustering <- kmeans(data_scaled, centers = k, nstart = 10)
+clusters <- as.factor(clustering$cluster)
+summary(clusters) 
+centroids <- clustering$centers 
+centroids
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+# Visualization of results
+levelplot(centroids, 
+          ylab = "Features", 
+          xlab = "clusters")
+
+# Return centroids to the original scale
+for (c in 1:ncol(centroids)) {
+  centroids[,c] <- centroids[,c] * sds[,c] + means[,c]
+}
+centroids
+
+data_subset$cluster <- clusters
+cluster_summary <- data_subset %>% group_by(cluster) %>% summarise(across(where(is.numeric), mean))
+```
+
+#### Step 5 - Business Plan for Expansion
+
+Cluster 1 makes the most business sense to target for expansion, as it is characterized by having many nearby machines. Cluster one can also be characterized by high machine margin, high concentration of hotels, high density, large machines, and no nearby train.
+
+Expanding our fleet by 5% would increase profitability as follows:
+
+```{r, message = FALSE, warning = FALSE}
+
+# Calculate existing profit over 3 months:
+current_margin <- sum(td$margin) %>% round()
+
+# Assume new cost of machine purchase and implementation cost of 1000 per machine
+new_machines <- ceiling(uniqueN(md$machine)*.05)
+
+new_machines_cost <- new_machines * 1500
+new_machines_revenues <- new_machines * cluster_summary$machine_margin[1]
+
+# Profit improvement over 3 month period:
+new_margin <- new_machines_revenues - new_machines_cost
+profit_improvement <- ((current_margin + new_margin) / current_margin - 1) * 100
+
+print(paste0("The expected increase in profitability is ", round(profit_improvement,2), "%"))
+```
